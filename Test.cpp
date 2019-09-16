@@ -15,11 +15,11 @@ struct TArg
 	~TArg() { printf("Arg destructor \n"); }
 };
 
-using Arg = TArg&;
+using Arg = const TArg&;
 
 struct TestSender
 {
-	Sender<Arg> mc_delegate;
+	SenderMultiCast<Arg> mc_delegate;
 	void Do(Arg val)
 	{
 		mc_delegate.Send(val);
@@ -38,10 +38,11 @@ int main()
 {
 	TestSender s;
 	TestReceiver r1, r2;
-	s.mc_delegate.Register(std::bind(&TestReceiver::Receive, r1, std::placeholders::_1));
+	s.mc_delegate.Register(std::bind(&TestReceiver::Receive, r1
+		, std::placeholders::_1));
 	s.mc_delegate.Register([&r2](Arg arg) { r2.Receive(arg); });
 
 	TArg arg;
 	s.Do(arg);
-	TaskQueue::get().Execute();
+	TaskQueue::Get().ExecuteTick(TMicrosecond{20*1000});
 }

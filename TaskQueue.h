@@ -4,11 +4,12 @@
 #include <deque>
 #include <functional>
 #include <array>
+#include <optional>
 #include <chrono>
 
 namespace TQ
 {
-	enum class ECategory : uint16_t
+	enum class ECategory : uint8_t
 	{
 		Unknown,
 		A,
@@ -17,10 +18,11 @@ namespace TQ
 		_Count
 	};
 
-	constexpr uint16_t CategoryToInt(ECategory c) { return static_cast<uint16_t>(c); }
+	constexpr uint8_t CategoryToInt(ECategory c) { return static_cast<uint8_t>(c); }
 
-	enum class EPriority : uint16_t
+	enum class EPriority : uint8_t
 	{
+		SkipAfter16Frames,
 		CanWait,
 		Tick,
 		Immediate,
@@ -29,11 +31,11 @@ namespace TQ
 	struct ID
 	{
 	private:
-		uint32_t data = 0;
+		uint16_t data = 0;
 	public:
 		static ID New()
 		{
-			static uint32_t id = 0;
+			static uint16_t id = 0;
 			id++;
 			ID result;
 			result.data = id;
@@ -41,58 +43,97 @@ namespace TQ
 		}
 	};
 
-	struct ReceiverBase
+	struct TaskInfo
 	{
+		ID id;
 		ECategory category = ECategory::Unknown;
 		EPriority priority = EPriority::CanWait;
-		ID id;
 	};
 
-	template<class... Args> struct Receiver : public ReceiverBase
+	template<class... Args> struct Receiver 
 	{
+		TaskInfo info;
 		std::function<void(Args...)> delegate_func;
 	};
 
-	struct Task
-	{
-		ReceiverBase receiver;
-		std::function<void()> delegate_func;
-	};
+	using TMicrosecond = std::chrono::microseconds;
 
 	class TaskQueue
 	{
-		using TMicrosecond = std::chrono::microseconds;
-
 		static const uint32_t kCategoryNum = CategoryToInt(ECategory::_Count) + 1;
+		struct Task
+		{
+			TaskInfo info;
+			uint32_t source_frame;
+			std::function<void()> delegate_func;
+		};
 
 		std::deque<Task> immediate_queue;
 		std::deque<Task> can_wait_queue;
 		std::deque<Task> tick_queue;
 		std::array<TMicrosecond, kCategoryNum> budgets;
+		uint32_t frame = 0;
+
 		TMicrosecond GetCurrentTime() const;
-	public:
 		TaskQueue();
-		static TaskQueue& get();
-		void AddTask(Task&& msg);
-		//TODO: Remove Tick task2
-		void Execute();
+		TaskQueue(const TaskQueue&) = delete;
+		TaskQueue(TaskQueue&&) = delete;
+	public:
+		static TaskQueue& Get();
+		void AddTask(TaskInfo info, std::function<void()>&& delegate_func);
+		uint32_t Remove(TaskInfo Info);
+		void ExecuteTick(TMicrosecond whole_tick_time);
 	};
 
-	template<class... Args> struct Sender
+	template<class... Args> class Sender
 	{
-	private:
+		using TReceiver = Receiver<Args...>;
+		std::optional<TReceiver> receiver;
+	public:
+		bool IsSet() const { receiver.has_value(); }
+		void Reset() { receiver.reset(); }
+
+		Sender() {}
+		Sender(std::function<void(Args...)>&& func
+			, ECategory category = ECategory::Unknown
+			, EPriority priority = EPriority::CanWait)
+		{
+			TReceiver rec;
+			rec.info.category = category;
+			rec.info.priority = priority;
+			rec.info.id = ID::New();
+			rec.delegate_func = std::move(func);
+			receiver.emplace(std::move(rec))
+		}
+
+		void Send(Args... args) const
+		{
+			if(receiver.has_value())
+			{
+				TaskQueue::Get().AddTask(receiver->info
+					, std::bind(receiver->delegate_func, args...));
+			}
+		}
+
+		//TODO:
+	};
+
+	template<class... Args> class SenderMultiCast
+	{
 		using TReceiver = Receiver<Args...>;
 		std::vector<TReceiver> receivers;
 
 	public:
 		 
-		ID Register(std::function<void(Args...)>&& func, ECategory category = ECategory::Unknown, EPriority priority = EPriority::CanWait)
+		ID Register(std::function<void(Args...)>&& func
+			, ECategory category = ECategory::Unknown
+			, EPriority priority = EPriority::CanWait)
 		{
 			ID id = ID::New();
 			TReceiver rec;
-			rec.category = category;
-			rec.priority = priority;
-			rec.id = id;
+			rec.info.category = category;
+			rec.info.priority = priority;
+			rec.info.id = id;
 			rec.delegate_func = std::move(func);
 			receivers.emplace_back(std::move(rec));
 			return id;
@@ -103,7 +144,7 @@ namespace TQ
 			uint32_t counter = 0;
 			for (auto it = receivers.begin(); it != receivers.end(); ) 
 			{
-				if (receivers[it].receiver_id == receiver_id)
+				if (receivers[it].info.receiver_id == receiver_id)
 				{
 					counter++;
 					it = receivers.erase(it);
@@ -120,10 +161,8 @@ namespace TQ
 		{
 			for (const auto& receiver : receivers)
 			{
-				Task task;
-				task.receiver = receiver;
-				task.delegate_func = std::bind(receiver.delegate_func, args...);
-				TaskQueue::get().AddTask(std::move(task));
+				TaskQueue::Get().AddTask(receiver.info
+					, std::bind(receiver.delegate_func, args...));
 			}
 		}
 	};
