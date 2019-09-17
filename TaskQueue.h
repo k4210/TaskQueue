@@ -1,11 +1,11 @@
 #pragma once
 
 #include <vector>
-#include <deque>
 #include <functional>
 #include <array>
 #include <optional>
 #include <chrono>
+#include <assert.h>
 
 namespace TQ
 {
@@ -24,7 +24,6 @@ namespace TQ
 	{
 		SkipAfter16Frames,
 		CanWait,
-		Tick,
 		Immediate,
 	};
 
@@ -41,6 +40,8 @@ namespace TQ
 			result.data = id;
 			return result;
 		}
+		bool operator==(const ID& other) const {return data == other.data; }
+		bool IsValid() const { return !!data; }
 	};
 
 	struct TaskInfo
@@ -48,12 +49,7 @@ namespace TQ
 		ID id;
 		ECategory category = ECategory::Unknown;
 		EPriority priority = EPriority::CanWait;
-	};
-
-	template<class... Args> struct Receiver 
-	{
-		TaskInfo info;
-		std::function<void(Args...)> delegate_func;
+		bool IsValid() const { return id.IsValid(); }
 	};
 
 	using TMicrosecond = std::chrono::microseconds;
@@ -64,46 +60,193 @@ namespace TQ
 		struct Task
 		{
 			TaskInfo info;
-			uint32_t source_frame;
+			uint32_t source_frame = 0;
 			std::function<void()> delegate_func;
+			Task* next = nullptr;
 		};
 
-		std::deque<Task> immediate_queue;
-		std::deque<Task> can_wait_queue;
-		std::deque<Task> tick_queue;
+		static const uint32_t kPoolSize = 1024;
+		std::array<Task, kPoolSize> pool;
+
+		struct SLList
+		{
+			Task* head = nullptr;
+			Task* tail = nullptr;
+
+			bool AnyElement() const { return nullptr != head; }
+			void PushBack(Task& task) 
+			{
+				assert(!task.next);
+				if (!tail)
+				{
+					assert(!head);
+					head = &task;
+					tail = &task;
+				}
+				else
+				{
+					assert(!tail->next);
+					tail->next = &task;
+					tail = &task;
+				}
+			}
+			void PushFront(Task& task)
+			{
+				assert(!task.next);
+				if (!head)
+				{
+					assert(!tail);
+					head = &task;
+					tail = &task;
+				}
+				else
+				{
+					task.next = head;
+					head = &task;
+				}
+			}
+			Task& PopFront()
+			{
+				assert(AnyElement());
+				if (tail == head)
+				{
+					tail = nullptr;
+				}
+				Task& result = *head;
+				head = head->next;
+				result.next = nullptr;
+				return result;
+			}
+
+			struct Iterator
+			{
+			private:
+				SLList& list;
+				SLList& free_list;
+				Task** local_head = nullptr;
+			public:
+				Iterator(SLList& in_list, SLList& in_free_list)
+					: list(in_list), free_list(in_free_list)
+					, local_head(&in_list.head) {}
+
+				Task* Get()
+				{
+					return local_head ? *local_head : nullptr;
+				}
+
+				void Advance()
+				{
+					if (local_head && *local_head)
+					{
+						local_head = &((*local_head)->next);
+					}
+				}
+
+				void Remove()
+				{
+					if (local_head && *local_head)
+					{
+						Task& removed = **local_head;
+						if (*local_head == list.tail)
+						{
+							if (list.head != *local_head)
+							{
+								const std::size_t offset = offsetof(Task, next);
+								Task* prev = reinterpret_cast<Task*>(reinterpret_cast<int8_t*>(local_head) - offset);
+								list.tail = prev;
+							}
+							else
+							{
+								assert(!removed.next);
+								list.tail = nullptr;
+							}
+						}
+						*local_head = removed.next;
+						removed = Task{};
+						free_list.PushFront(removed);
+					}
+				}
+			};
+		};
+
+		SLList free_list;
+		SLList immediate_queue;
+		SLList can_wait_queue;
+		SLList skip_after_16;
+
 		std::array<TMicrosecond, kCategoryNum> budgets;
+		std::array<std::vector<TaskInfo>, 3> to_remove;
 		uint32_t frame = 0;
 
-		TMicrosecond GetCurrentTime() const;
+		void InitializeFreeList()
+		{
+			free_list.head = &pool[0];
+			free_list.tail = free_list.head;
+			for (int32_t idx = 1; idx < kPoolSize; idx++)
+			{
+				Task* ptr = &pool[idx];
+				free_list.tail->next = ptr;
+				free_list.tail = ptr;
+			}
+		}
+		SLList& GetList(EPriority priority);
+
 		TaskQueue();
 		TaskQueue(const TaskQueue&) = delete;
 		TaskQueue(TaskQueue&&) = delete;
+
+		void RemovePending(SLList& list, std::vector<TaskInfo>& pending);
 	public:
 		static TaskQueue& Get();
 		void AddTask(TaskInfo info, std::function<void()>&& delegate_func);
-		uint32_t Remove(TaskInfo Info);
+		void Remove(TaskInfo Info);
 		void ExecuteTick(TMicrosecond whole_tick_time);
 	};
 
+	namespace details 
+	{
+		template<class... Args> struct Receiver
+		{
+			TaskInfo info;
+			std::function<void(Args...)> delegate_func;
+
+			Receiver() {}
+			Receiver(std::function<void(Args...)>&& func, TaskInfo ti)
+				: delegate_func(std::move(func)), info(ti) {}
+			Receiver(std::function<void(Args...)>&& func
+				, ID id, ECategory category, EPriority priority) 
+				: delegate_func(std::move(func))
+				, info{ id, category, priority }
+			{}
+		};
+	}
+
 	template<class... Args> class Sender
 	{
-		using TReceiver = Receiver<Args...>;
+		using TReceiver = details::Receiver<Args...>;
 		std::optional<TReceiver> receiver;
 	public:
 		bool IsSet() const { receiver.has_value(); }
 		void Reset() { receiver.reset(); }
-
+		TaskInfo GetTaskInfo() const
+		{
+			return receiver.has_value() ? receiver->info : TaskInfo{};
+		}
 		Sender() {}
+		Sender(const Sender& other) : receiver(other.receiver) {}
 		Sender(std::function<void(Args...)>&& func
 			, ECategory category = ECategory::Unknown
 			, EPriority priority = EPriority::CanWait)
+			: receiver(std::in_place, std::move(func), ID::New(), category, priority)
+		{}
+		Sender& operator=(const Sender& other)
 		{
-			TReceiver rec;
-			rec.info.category = category;
-			rec.info.priority = priority;
-			rec.info.id = ID::New();
-			rec.delegate_func = std::move(func);
-			receiver.emplace(std::move(rec))
+			receiver = other.receiver;
+		}
+		Sender& operator=(Sender&& other)
+		{
+			receiver = std::move(other.receiver);
+			return *this;
 		}
 
 		void Send(Args... args) const
@@ -115,28 +258,29 @@ namespace TQ
 			}
 		}
 
-		//TODO:
+		void RemovePendingTask() const
+		{
+			if (receiver.has_value())
+			{
+				TaskQueue::Get().Remove(receiver->info);
+			}
+		}
 	};
 
 	template<class... Args> class SenderMultiCast
 	{
-		using TReceiver = Receiver<Args...>;
+		using TReceiver = details::Receiver<Args...>;
 		std::vector<TReceiver> receivers;
 
 	public:
 		 
-		ID Register(std::function<void(Args...)>&& func
+		TaskInfo Register(std::function<void(Args...)>&& func
 			, ECategory category = ECategory::Unknown
 			, EPriority priority = EPriority::CanWait)
 		{
-			ID id = ID::New();
-			TReceiver rec;
-			rec.info.category = category;
-			rec.info.priority = priority;
-			rec.info.id = id;
-			rec.delegate_func = std::move(func);
-			receivers.emplace_back(std::move(rec));
-			return id;
+			TaskInfo info{ ID::New(), category, priority };
+			receivers.emplace_back(std::move(TReceiver(std::move(func), info)));
+			return info;
 		}
 
 		uint32_t UnRegister(ID receiver_id)
@@ -163,6 +307,14 @@ namespace TQ
 			{
 				TaskQueue::Get().AddTask(receiver.info
 					, std::bind(receiver.delegate_func, args...));
+			}
+		}
+
+		void RemovePendingTasks() const
+		{
+			for (const auto& receiver : receivers)
+			{
+				TaskQueue::Get().Remove(receiver.info);
 			}
 		}
 	};

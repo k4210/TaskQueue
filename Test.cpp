@@ -12,7 +12,7 @@ struct TArg
 	TArg(TArg&& a) : data(a.data) { a.data = 0; printf("Arg move constructor \n"); }
 	TArg& operator=(const TArg& a) { data = a.data; printf("Arg assign operator <--- \n"); return *this; }
 	TArg& operator=(TArg&& a) { data = a.data; a.data = 0; printf("Arg move assign operator \n"); return *this; }
-	~TArg() { printf("Arg destructor \n"); }
+	//~TArg() { printf("Arg destructor \n");
 };
 
 using Arg = const TArg&;
@@ -20,9 +20,11 @@ using Arg = const TArg&;
 struct TestSender
 {
 	SenderMultiCast<Arg> mc_delegate;
+	Sender<Arg> sc_delegate;
 	void Do(Arg val)
 	{
 		mc_delegate.Send(val);
+		sc_delegate.Send(val);
 	}
 };
 
@@ -42,7 +44,15 @@ int main()
 		, std::placeholders::_1));
 	s.mc_delegate.Register([&r2](Arg arg) { r2.Receive(arg); });
 
+	s.sc_delegate = Sender<Arg>(
+		[](Arg val) { printf("Received 2 %d\n", val.data); }
+		, ECategory::A, EPriority::Immediate);
+
 	TArg arg;
 	s.Do(arg);
 	TaskQueue::Get().ExecuteTick(TMicrosecond{20*1000});
+	s.Do(arg);
+	s.mc_delegate.RemovePendingTasks();
+	TaskQueue::Get().ExecuteTick(TMicrosecond{ 20 * 1000 });
+
 }
