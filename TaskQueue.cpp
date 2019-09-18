@@ -13,11 +13,8 @@ TaskQueue::TaskQueue()
 {
 	InitializeFreeList();
 
-	budgets[CategoryToInt(ECategory::Unknown)]	= TMicrosecond{ 1 };
-	budgets[CategoryToInt(ECategory::A)]		= TMicrosecond{ 5000 };
-	budgets[CategoryToInt(ECategory::B)]		= TMicrosecond{ 5000 };
-	budgets[CategoryToInt(ECategory::C)]		= TMicrosecond{ 5000 };
-	budgets[CategoryToInt(ECategory::_Count)]	= TMicrosecond{ 16000 };
+	budgets[CategoryToInt(ECategory::Unknown)]	= TMicrosecond{ 500 };
+	budgets[CategoryToInt(ECategory::Sample)]	= TMicrosecond{ 500 };
 }
 
 void TaskQueue::AddTask(TaskInfo info, std::function<void()>&& delegate_func)
@@ -27,18 +24,11 @@ void TaskQueue::AddTask(TaskInfo info, std::function<void()>&& delegate_func)
 	task.delegate_func = std::move(delegate_func);
 	task.info = info;
 	task.source_frame = frame;
-	GetList(task.info.priority).PushBack(task);
-}
-
-TaskQueue::SLList& TaskQueue::GetList(EPriority priority)
-{
-	switch (priority)
+	switch (task.info.priority)
 	{
-		case EPriority::SkipAfter16Frames:	return skip_after_16;
-		case EPriority::CanWait:			return can_wait_queue;
-		case EPriority::Immediate:
-		default:
-			return immediate_queue;
+		case EPriority::SkipAfter16Frames:	skip_after_16.PushBack(task); break;
+		case EPriority::CanWait:			can_wait_queue.PushBack(task); break;
+		case EPriority::Immediate:			immediate_queue.PushBack(task); break;
 	}
 }
 
@@ -46,9 +36,9 @@ void TaskQueue::Remove(TaskInfo info)
 {
 	switch (info.priority)
 	{
-	case EPriority::SkipAfter16Frames:	to_remove[0].push_back(info);
-	case EPriority::CanWait:			to_remove[1].push_back(info);
-	case EPriority::Immediate:			to_remove[2].push_back(info);
+		case EPriority::SkipAfter16Frames:	to_remove[0].push_back(info); break;
+		case EPriority::CanWait:			to_remove[1].push_back(info); break;
+		case EPriority::Immediate:			to_remove[2].push_back(info); break;
 	}
 }
 
@@ -67,13 +57,83 @@ void TaskQueue::RemovePending(SLList& list, std::vector<TaskInfo>& pending)
 	pending.clear();
 }
 
-//TODO: Stats with ifdef
+#define  STAT 1
+#if STAT
+struct StatPerCategory
+{
+	uint32_t done_base_time = 0;
+	uint32_t pending = 0;
+	uint32_t done_additional_time = 0;
+	uint32_t skipped = 0;
+	TMicrosecond remaining_time{ 0 };
+};
+
+struct Stats
+{
+	std::array<StatPerCategory, TaskQueue::kCategoryNum> stats;
+	void FillBaseTime(const std::array<TMicrosecond, TaskQueue::kCategoryNum>& remaining)
+	{
+		for (uint32_t idx = 0; idx < TaskQueue::kCategoryNum; idx++)
+		{
+			stats[idx].remaining_time = remaining[idx];
+		}
+	}
+
+	void Print(uint32_t frame, const std::array<TMicrosecond, TaskQueue::kCategoryNum>& budgets)
+	{
+		printf("Frame: %d\n", frame);
+		printf("Cat.: \tDone: \tAdd.: \tRem.: \tSkip: \tRem Time: \tBudget:\n");
+		for (uint32_t idx = 0; idx < TaskQueue::kCategoryNum; idx++)
+		{
+			const auto& s = stats[idx];
+			printf("  %3d \t%5d \t%5d \t%5d \t%5d\t%+3.3f  \t%+3.3f [ms]\n"
+				, idx, s.done_base_time, s.done_additional_time, s.pending, s.skipped
+				, s.remaining_time.count() / 1000.0f
+				, budgets[idx].count() / 1000.0f);
+		}
+	}
+
+	void DoneBaseTime(TaskQueue::Task& task)
+	{
+		stats[CategoryToInt(task.info.category)].done_base_time++;
+	}
+
+	void DoneAdditionalTime(TaskQueue::Task& task)
+	{
+		auto& s = stats[CategoryToInt(task.info.category)];
+		s.done_additional_time++;
+		s.pending--;
+	}
+
+	void NotDone(TaskQueue::Task& task)
+	{
+		stats[CategoryToInt(task.info.category)].pending++;
+	}
+
+	void Skipped(TaskQueue::Task& task)
+	{
+		stats[CategoryToInt(task.info.category)].skipped++;
+	}
+};
+#else
+struct Stats
+{
+	void FillBaseTime(const std::array<TMicrosecond, kCategoryNum>&) {}
+	void Print(uint32_t, const std::array<TMicrosecond, kCategoryNum>&) {}
+	void DoneBaseTime(TaskQueue::Task&) {}
+	void DoneAdditionalTime(TaskQueue::Task&) {}
+	void NotDone(TaskQueue::Task&) {}
+	void Skipped(TaskQueue::Task&) {}
+};
+#endif
+
 void TaskQueue::ExecuteTick(TMicrosecond whole_tick_time)
 {
 	RemovePending(skip_after_16,   to_remove[0]);
 	RemovePending(can_wait_queue,  to_remove[1]);
 	RemovePending(immediate_queue, to_remove[2]);
 	
+	Stats stats;
 	auto get_time = []() -> TMicrosecond
 	{
 		return std::chrono::duration_cast<TMicrosecond>(
@@ -89,67 +149,82 @@ void TaskQueue::ExecuteTick(TMicrosecond whole_tick_time)
 		current_time = get_time();
 		budget -= current_time - old_time;
 	};
+	auto has_time = [&]() { return (get_time() - start_time) < whole_tick_time; };
 
 	for (auto iter = SLList::Iterator(immediate_queue, free_list); iter.Get(); )
 	{
 		Task& task = *iter.Get();
 		auto& local_budget = local_budgets[CategoryToInt(task.info.category)];
-
 		task.delegate_func();
+		stats.DoneBaseTime(task);
 		iter.Remove();
 		update_time(local_budget);
 	}
 
-	for (auto iter = SLList::Iterator(can_wait_queue, free_list); iter.Get(); )
+	if (has_time())
 	{
-		Task& task = *iter.Get();
-		auto& local_budget = local_budgets[CategoryToInt(task.info.category)];
-		if (local_budget <= TMicrosecond::zero())
+		for (auto iter = SLList::Iterator(can_wait_queue, free_list); iter.Get(); )
 		{
-			iter.Advance();
-			continue;
-		}
-		
-		task.delegate_func();
-		iter.Remove();
-		update_time(local_budget);
-	}
+			Task& task = *iter.Get();
+			auto& local_budget = local_budgets[CategoryToInt(task.info.category)];
+			if (local_budget <= TMicrosecond::zero())
+			{
+				stats.NotDone(task);
+				iter.Advance();
+				continue;
+			}
 
-	for (auto iter = SLList::Iterator(skip_after_16, free_list); iter.Get(); )
-	{
-		Task& task = *iter.Get();
-		if ((frame - task.source_frame) > 16)
-		{
+			task.delegate_func();
+			stats.DoneBaseTime(task);
 			iter.Remove();
-			continue;
+			update_time(local_budget);
 		}
-
-		auto& local_budget = local_budgets[CategoryToInt(task.info.category)];
-		if (local_budget <= TMicrosecond::zero())
-		{
-			iter.Advance();
-			continue;
-		}
-
-		task.delegate_func();
-		iter.Remove();
-		update_time(local_budget);
 	}
+	if (has_time())
+	{
+		for (auto iter = SLList::Iterator(skip_after_16, free_list); iter.Get(); )
+		{
+			Task& task = *iter.Get();
+			if ((frame - task.source_frame) > 16)
+			{
+				stats.Skipped(task);
+				iter.Remove();
+				continue;
+			}
 
-	auto has_time = [&](){ return (get_time() - start_time) < whole_tick_time; };
+			auto& local_budget = local_budgets[CategoryToInt(task.info.category)];
+			if (local_budget <= TMicrosecond::zero())
+			{
+				stats.NotDone(task);
+				iter.Advance();
+				continue;
+			}
+
+			task.delegate_func();
+			stats.DoneBaseTime(task);
+			iter.Remove();
+			update_time(local_budget);
+		}
+	}
+	stats.FillBaseTime(local_budgets);
+
 	while (has_time() && can_wait_queue.AnyElement())
 	{
 		Task& task = can_wait_queue.PopFront();
 		task.delegate_func();
-		update_time(local_budgets[CategoryToInt(task.info.category)]);
+		stats.DoneAdditionalTime(task);
+		task = Task{};
+		free_list.PushFront(task);
 	}
 
 	while (has_time() && skip_after_16.AnyElement())
 	{
-		Task task = skip_after_16.PopFront();
+		Task& task = skip_after_16.PopFront();
 		task.delegate_func();
-		update_time(local_budgets[CategoryToInt(task.info.category)]);
+		stats.DoneAdditionalTime(task);
+		task = Task{};
+		free_list.PushFront(task);
 	}
-
+	stats.Print(frame, budgets);
 	frame++;
 }

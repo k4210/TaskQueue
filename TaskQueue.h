@@ -12,9 +12,7 @@ namespace TQ
 	enum class ECategory : uint8_t
 	{
 		Unknown,
-		A,
-		B,
-		C,
+		Sample,
 		_Count
 	};
 
@@ -56,7 +54,8 @@ namespace TQ
 
 	class TaskQueue
 	{
-		static const uint32_t kCategoryNum = CategoryToInt(ECategory::_Count) + 1;
+	public:
+		static const uint32_t kCategoryNum = CategoryToInt(ECategory::_Count);
 		struct Task
 		{
 			TaskInfo info;
@@ -64,7 +63,7 @@ namespace TQ
 			std::function<void()> delegate_func;
 			Task* next = nullptr;
 		};
-
+	private:
 		static const uint32_t kPoolSize = 1024;
 		std::array<Task, kPoolSize> pool;
 
@@ -89,6 +88,7 @@ namespace TQ
 					tail->next = &task;
 					tail = &task;
 				}
+				assert(!tail->next);
 			}
 			void PushFront(Task& task)
 			{
@@ -104,6 +104,7 @@ namespace TQ
 					task.next = head;
 					head = &task;
 				}
+				assert(!tail->next);
 			}
 			Task& PopFront()
 			{
@@ -152,7 +153,8 @@ namespace TQ
 							if (list.head != *local_head)
 							{
 								const std::size_t offset = offsetof(Task, next);
-								Task* prev = reinterpret_cast<Task*>(reinterpret_cast<int8_t*>(local_head) - offset);
+								Task* prev = reinterpret_cast<Task*>
+									(reinterpret_cast<int8_t*>(local_head) - offset);
 								list.tail = prev;
 							}
 							else
@@ -189,7 +191,6 @@ namespace TQ
 				free_list.tail = ptr;
 			}
 		}
-		SLList& GetList(EPriority priority);
 
 		TaskQueue();
 		TaskQueue(const TaskQueue&) = delete;
